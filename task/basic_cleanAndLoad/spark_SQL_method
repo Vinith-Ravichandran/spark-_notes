@@ -1,0 +1,118 @@
+import os
+import sys
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StringType
+
+def main():
+    """
+    A full demonstration of a basic PySpark application using Spark SQL.
+    """
+    # --- 1. Initialize SparkSession (Same as before) ---
+    os.environ['PYSPARK_PYTHON'] = sys.executable
+    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+
+    spark = SparkSession.builder \
+        .appName("SparkSQLDemo") \
+        .master("local[*]") \
+        .getOrCreate()
+
+    print("--- SparkSession Initialized ---")
+    print(f"Spark Version: {spark.version}")
+    print(f"Access SparkUI at: http://localhost:4040")
+
+    # --- 2. Load Data from CSV files (Same as before) ---
+    print("\n--- Loading DataFrames from CSV files ---")
+    employees_df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+    departments_df = spark.read.csv("departments.csv", header=True, inferSchema=True)
+
+    # --- 3. Create Temporary Views for Spark SQL ---
+    # This is the key step to make DataFrames queryable with SQL.
+    employees_df.createOrReplaceTempView("employees")
+    departments_df.createOrReplaceTempView("departments")
+    print("\n--- Registered DataFrames as temporary SQL views: 'employees' and 'departments' ---")
+
+
+    # --- 4. Data Cleaning and Transformation (using Spark SQL) ---
+    print("\n--- Cleaning and Transforming Data using SQL ---")
+    # We execute a SQL query and the result is a new DataFrame.
+    cleaned_employees_df = spark.sql("""
+        SELECT id, name, department_id, salary
+        FROM employees
+        WHERE department_id IS NOT NULL
+    """)
+    print("Employees after removing null department_id:")
+    cleaned_employees_df.show()
+
+    # Register the cleaned view for the next step
+    cleaned_employees_df.createOrReplaceTempView("cleaned_employees")
+
+
+    # --- 5. Aggregation: GroupBy (using Spark SQL) ---
+    print("\n--- Aggregating Data by Department using SQL ---")
+    department_stats_df = spark.sql("""
+        SELECT
+            department_id,
+            AVG(salary) AS average_salary,
+            MAX(salary) AS max_salary,
+            COUNT(id) AS employee_count
+        FROM cleaned_employees
+        GROUP BY department_id
+    """)
+    print("Department Statistics:")
+    department_stats_df.show()
+
+
+    # --- 6. Joins (using Spark SQL) ---
+    print("\n--- Joining Employee and Department DataFrames using SQL ---")
+    full_employee_data_df = spark.sql("""
+        SELECT
+            e.id,
+            e.name,
+            e.department_id,
+            e.salary,
+            d.department_name
+        FROM cleaned_employees e
+        LEFT JOIN departments d ON e.department_id = d.id
+    """)
+    print("Joined Data:")
+    full_employee_data_df.show()
+
+    # Register the joined view for the final step
+    full_employee_data_df.createOrReplaceTempView("full_employee_data")
+
+
+    # --- 7. User-Defined Function (UDF) (using Spark SQL) ---
+    print("\n--- Using a User-Defined Function (UDF) with SQL ---")
+
+    # Define the Python function (same as before)
+    def to_upper_case(name_str):
+        return name_str.upper()
+
+    # Register the UDF for use in SQL, giving it a name for SQL to call.
+    spark.udf.register("UPPER_CASE_UDF", to_upper_case, StringType())
+
+    # Apply the UDF inside a SQL query
+    final_df = spark.sql("""
+        SELECT
+            id,
+            name,
+            UPPER_CASE_UDF(name) AS name_upper,
+            department_name,
+            salary
+        FROM full_employee_data
+    """)
+    print("Final DataFrame with Uppercase Name column:")
+    final_df.show()
+
+
+    # --- 8. Pause to view Spark UI (Same as before) ---
+    input("\n--- Script complete. Press Enter to stop SparkSession. ---")
+
+
+    # --- 9. Stop the SparkSession (Same as before) ---
+    spark.stop()
+    print("--- SparkSession Stopped ---")
+
+
+if _name_ == "_main_":
+    main()
