@@ -1,0 +1,76 @@
+import os 
+import sys
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col,avg,max,count,udf
+from pyspark.sql.types import StringType
+
+def main():
+    os.environ['PYSPARK_PYTHON'] = sys.executable
+    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+
+    spark = SparkSession.builder \
+        .appName("SparkCompleteDemo") \
+        .master("local[*]") \
+        .getOrCreate()
+
+    print("--- SparkSession Initialized ---")
+    print(f"Spark Version: {spark.version}")
+    print(f"Access SparkUI at: http://localhost:4040")
+
+    print("\n--- Loading DataFrames from CSV files ---")
+    employees_df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+    departments_df = spark.read.csv("departments.csv", header=True, inferSchema=True)
+
+    print("Employee Schema:")
+    employees_df.printSchema()
+    print("Initial Employee Data:")
+    employees_df.show()
+
+    print("Department Schema:")
+    departments_df.printSchema()
+    print("Department Data:")
+    departments_df.show()
+
+    print("\n--- Cleaning and Transforming Data ---")
+    cleaned_employees_df = employees_df \
+        .filter(col("department_id").isNotNull()) \
+        .select("id", "name", "department_id", "salary")
+
+    print("Employees after removing null department_id:")
+    cleaned_employees_df.show()
+
+    print("\n--- Aggregating Data by Department ---")
+    department_stats_df = cleaned_employees_df.groupBy("department_id") \
+        .agg(
+            avg("salary").alias("average_salary"),
+            max("salary").alias("max_salary"),
+            count("id").alias("employee_count")
+        )
+
+    print("Department Statistics:")
+    department_stats_df.show()
+
+    print("\n--- Joining Employee and Department DataFrames ---")
+    full_employee_data_df = cleaned_employees_df.join(
+        departments_df,
+        cleaned_employees_df.department_id == departments_df.id,
+        "left"
+    ).drop(departments_df.id) # <--- THIS IS THE FIX
+
+    print("Joined Data (ambiguous 'id' column has been dropped):")
+    full_employee_data_df.show()
+
+    print("\n--- Using a User-Defined Function (UDF) ---")
+    def to_upper_case(name_str):
+        return name_str.upper()
+
+    upper_case_udf = udf(to_upper_case, StringType())
+
+    final_df = full_employee_data_df.withColumn("name_upper", upper_case_udf(col("name")))
+    print("Final DataFrame with Uppercase Name column:")
+    final_df.select("id", "name", "name_upper", "department_name", "salary").show()
+
+    input("\n--- Script complete. Press Enter to stop SparkSession. ---")
+
+    spark.stop()
+    print("--- SparkSession Stopped ---")
