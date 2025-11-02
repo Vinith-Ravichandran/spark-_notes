@@ -1,0 +1,156 @@
+# scd2_bigquery_migration.py
+
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, lit, sha2, concat_ws, current_date, monotonically_increasing_id
+
+# --- Configuration ---
+# IMPORTANT: Replace these with your actual GCP project, dataset, and GCS bucket details.
+GCP_PROJECT = "your-gcp-project-id"
+BQ_DATASET = "my_dataset"
+BQ_SOURCE_TABLE = "source_products"
+BQ_TARGET_TABLE = "dim_products"
+GCS_TEMP_BUCKET = "your-gcs-temp-bucket-name"
+
+# --- Main Application ---
+def main():
+    # 1. Initialize SparkSession with BigQuery Connector configuration
+    spark = SparkSession.builder \
+        .appName("PySpark SCD2 for BigQuery") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.34.0") \
+        .getOrCreate()
+
+    # Configure the BigQuery connector
+    spark.conf.set("parentProject", GCP_PROJECT)
+    spark.conf.set("temporaryGcsBucket", GCS_TEMP_BUCKET)
+
+    # Define a function for reading from BigQuery
+    def read_from_bq(table_id):
+        return spark.read.format("bigquery") \
+            .option("table", f"{GCP_PROJECT}.{BQ_DATASET}.{table_id}") \
+            .load()
+
+    print("--- 1. Loading data from BigQuery ---")
+    source_df = read_from_bq(BQ_SOURCE_TABLE)
+    
+    try:
+        target_df = read_from_bq(BQ_TARGET_TABLE)
+        target_current_df = target_df.filter(col("is_current") == True)
+    except Exception as e:
+        # Handle case where the target table doesn't exist yet (first run)
+        print("Target table not found or empty. This must be the initial load.")
+        target_current_df = None
+
+    # --- 2. Create a hash to easily detect changes in tracked columns ---
+    # This is more robust than comparing each column individually.
+    tracked_columns = ["name", "price"]
+    source_df = source_df.withColumn("data_hash", sha2(concat_ws("||", *tracked_columns), 256))
+
+    if target_current_df:
+        target_current_df = target_current_df.withColumn("data_hash", sha2(concat_ws("||", *tracked_columns), 256))
+    else:
+        # If the target is empty, all source records are new.
+        print("--- 2a. Initial Load: All source records are new. ---")
+        initial_load_df = source_df.withColumn("start_date", current_date()) \
+                                   .withColumn("end_date", lit(None).cast("date")) \
+                                   .withColumn("is_current", lit(True)) \
+                                   .withColumn("product_key", sha2(concat_ws("||", col("product_id"), col("start_date")), 256)) \
+                                   .drop("data_hash")
+        
+        print("--- 5. Writing initial load to BigQuery target table ---")
+        initial_load_df.write.format("bigquery") \
+            .option("table", f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TARGET_TABLE}") \
+            .mode("overwrite") \
+            .save()
+        
+        print("--- Initial Load Complete ---")
+        spark.stop()
+        return
+
+    # --- 3. Join source and target to find changes (Incremental Load) ---
+    print("--- 3. Identifying new, changed, and unchanged records ---")
+    join_df = source_df.join(
+        target_current_df,
+        source_df.product_id == target_current_df.product_id,
+        "full_outer"
+    ).select(
+        source_df["*"],
+        target_current_df.product_id.alias("tgt_product_id"),
+        target_current_df.data_hash.alias("tgt_data_hash"),
+        target_current_df.product_key.alias("tgt_product_key")
+    )
+
+    # --- 4. Process the different record types ---
+    
+    # 4a. New Records: Exist in source, not in target
+    new_records_df = join_df.filter(col("tgt_product_id").isNull()) \
+        .select(
+            col("product_id"),
+            *tracked_columns,
+            lit(current_date()).alias("start_date"),
+            lit(None).cast("date").alias("end_date"),
+            lit(True).alias("is_current")
+        ).withColumn("product_key", sha2(concat_ws("||", col("product_id"), col("start_date")), 256))
+    print("New records found:")
+    new_records_df.show()
+
+    # 4b. Expired Records: Records that have changed
+    expired_records_df = join_df.filter(
+        (col("product_id").isNotNull()) & 
+        (col("tgt_product_id").isNotNull()) & 
+        (col("data_hash") != col("tgt_data_hash"))
+    ).select(
+        col("tgt_product_key").alias("product_key"),
+        col("tgt_product_id").alias("product_id"),
+        *[target_current_df[c] for c in tracked_columns],
+        target_current_df.start_date,
+        lit(current_date()).alias("end_date"),
+        lit(False).alias("is_current")
+    )
+    print("Expired (old versions of updated) records:")
+    expired_records_df.show()
+
+    # 4c. Updated Records: The new versions of records that have changed
+    updated_records_df = join_df.filter(
+        (col("product_id").isNotNull()) & 
+        (col("tgt_product_id").isNotNull()) & 
+        (col("data_hash") != col("tgt_data_hash"))
+    ).select(
+        col("product_id"),
+        *tracked_columns,
+        lit(current_date()).alias("start_date"),
+        lit(None).cast("date").alias("end_date"),
+        lit(True).alias("is_current")
+    ).withColumn("product_key", sha2(concat_ws("||", col("product_id"), col("start_date")), 256))
+    print("Updated (new versions) records:")
+    updated_records_df.show()
+
+    # 4d. Unchanged Records: No changes detected. Also includes records no longer in source.
+    unchanged_df = target_df.join(
+        expired_records_df,
+        target_df.product_key == expired_records_df.product_key,
+        "left_anti" # Keep only records from target that were NOT expired
+    )
+    print("Unchanged historical records carried forward:")
+    unchanged_df.show()
+
+    # --- 5. Union all the processed DataFrames ---
+    final_df = new_records_df.unionByName(expired_records_df) \
+                             .unionByName(updated_records_df) \
+                             .unionByName(unchanged_df)
+    
+    print("--- Final combined DataFrame to be written ---")
+    final_df.show()
+
+    # --- 6. Write the final DataFrame back to BigQuery, overwriting the table ---
+    print("--- 6. Writing final data to BigQuery target table ---")
+    final_df.write.format("bigquery") \
+        .option("table", f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TARGET_TABLE}") \
+        .mode("overwrite") \
+        .save()
+
+    print("--- Incremental SCD2 Load Complete ---")
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
