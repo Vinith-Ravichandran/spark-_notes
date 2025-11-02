@@ -1,0 +1,9 @@
+id,name,department_id,salary
+1,James,101,60000
+2,Michael,102,80000
+3,Robert,101,55000
+4,Maria,102,90000
+5,Jen,103,45000
+6,Scott,101,72000
+7,Julia,,85000
+8,David,104,65000
