@@ -1,0 +1,20 @@
+-- This is your source of truth, updated daily.
+CREATE TABLE my_dataset.source_products (
+  product_id INT64,
+  name STRING,
+  price NUMERIC
+);
+
+-- This is our historical SCD2 table.
+CREATE TABLE my_dataset.dim_products (
+  product_key STRING,     -- A unique surrogate key for each row
+  product_id INT64,      -- The business key
+  name STRING,
+  price NUMERIC,
+  start_date DATE,
+  end_date DATE,
+  is_current BOOL
+);
+
+
+
